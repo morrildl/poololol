@@ -1,34 +1,71 @@
-menu "LEL Configuration"
+menu "Poololol Configuration"
 
     orsource "$IDF_PATH/examples/common_components/env_caps/$IDF_TARGET/Kconfig.env_caps"
 
-    config WIFI_SSID
+    config POOLOLOL_WIFI_SSID
         string "WiFi SSID"
         default "myssid"
         help
             SSID (network name) for the example to connect to.
 
-    config WIFI_WPA2_PASSWORD
+    config POOLOLOL_WIFI_WPA2_PASSWORD
         string "WiFi Password"
         default "mypassword"
         help
             WiFi password (WPA or WPA2) for the example to use.
 
-    config WIFI_MAXIMUM_RETRY
-        int "Maximum retry"
-        default 5
+    config POOLOLOL_BT_SERVICE_UUID
+        hex "Characteristic UUID"
+        default 0xfff0
         help
-            Set the Maximum retry to avoid station reconnecting to the AP unlimited when the AP is really inexistent.
+            UUID of Bluetooth characteristic containing realtime data
     
-    config BT_MAC
-        string "Bluetooth MAC address"
+    config POOLOLOL_BT_CHARACTERISTIC_UUID
+        hex "Characteristic UUID"
+        default 0xfff2
+        help
+            UUID of Bluetooth characteristic containing realtime data
+    
+    config POOLOLOL_MQTT_URI
+        string "URI of the MQTT server"
         default ""
         help
-            The MAC address of the IBS-P01B
-
-    config BT_CHARACTERISTIC
-        hex "Characteristic ID"
-        default 0x0023
+            URI (including `mqtt://`) of the MQTT server
+    
+    config POOLOLOL_MQTT_TOPIC_PREFIX
+        string "MQTT topic prefix"
+        default "widgets/"
         help
-            Bluetooth characteristic containing realtime data
+            Topic (including "/") to post messages under. MQTT_DEVICE_NAME will be appended.
+
+    config POOLOLOL_MQTT_HEARTBEAT_TOPIC_PREFIX
+        string "MQTT status topic prefix"
+        default "status/"
+        help
+            Topic (including "/") to post messages under. MQTT_DEVICE_NAME will be appended.
+    
+    config POOLOLOL_MQTT_HEARTBEAT_PERIOD
+        int "MQTT heartbeat period"
+        default 60
+        help
+            The period to use for sending heartbeat pings to MQTT, in seconds
+
+    config POOLOLOL_MQTT_DEVICE_NAME
+        string "MQTT device name"
+        default "pool_thermometer"
+        help
+            The name of the Bluetooth device to use in MQTT message body and topic
+
+    config POOLOLOL_MQTT_TEMPERATURE_FIELD
+        string "Name of the JSON field"
+        default "degrees_celcius"
+        help
+            The JSON output will look something like `{"device": "pool_thermometer", "{{FIELD}}": 24.08}`. This sets the value for {{FIELD}}.
+
+    config POOLOLOL_POLL_PERIOD
+        int "Bluetooth polling period"
+        default 600
+        help
+            The period to use for polling the Bluetooth temperature sensor, in seconds
+    
 endmenu
