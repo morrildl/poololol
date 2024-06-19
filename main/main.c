@@ -96,7 +96,7 @@ static void reset_bt() {
   //gattc_profile.gattc_if = ESP_GATT_IF_NONE; // don't need to clear this, it's just a hardware handle
 }
 
-/** Starts a poll of the Inkbird widget. Embeds the timer delay, and ultimately calls poll_once(). */
+/** Starts a poll that scans for an Inkbird widget. Embeds the timer delay, and ultimately calls poll_once(). */
 static esp_err_t poll() {
   reset_bt();
   ESP_LOGI(POOLOLOL_TAG, "requesting new pool attempt in %llu", POLL_PERIOD);
@@ -110,6 +110,7 @@ static void poll_once() {
   esp_ble_gap_start_scanning(duration);
 }
 
+/** Sends a heartbeat message to the MQTT server on a separate topic from the data samples. Includes some system status info, because why not. */
 static void heartbeat() {
   multi_heap_info_t heap;
   char message[256];
@@ -119,7 +120,7 @@ static void heartbeat() {
     CONFIG_POOLOLOL_MQTT_DEVICE_NAME,
     heap.total_free_bytes, heap.total_allocated_bytes, heap.largest_free_block, heap.minimum_free_bytes, heap.allocated_blocks, heap.free_blocks, heap.total_blocks);
   ESP_LOGI(POOLOLOL_TAG, "Sending heartbeat/health message");
-  esp_mqtt_client_publish(mqtt_client, CONFIG_POOLOLOL_MQTT_HEARTBEAT_TOPIC_PREFIX CONFIG_POOLOLOL_MQTT_DEVICE_NAME, message, 0, 0, 0);
+  esp_mqtt_client_publish(mqtt_client, CONFIG_POOLOLOL_MQTT_HEARTBEAT_TOPIC_PREFIX CONFIG_POOLOLOL_MQTT_DEVICE_NAME, message, 0, 0, 1); // retained
 }
 
 
@@ -127,6 +128,7 @@ static void heartbeat() {
  * Event Handlers
  */
 
+/** WiFi callback that tries really hard to stay connected, by kicking off a new reconnection whenever WiFi disconnects. */
 static void wifi_event_handler(void *arg, esp_event_base_t event_base, int32_t event_id, void *event_data) {
   ESP_LOGE(POOLOLOL_TAG, "%s", "wifi handler");
   if (event_base != WIFI_EVENT) return;
@@ -140,6 +142,7 @@ static void wifi_event_handler(void *arg, esp_event_base_t event_base, int32_t e
   }
 }
 
+/** A basic MQTT callback. There's not much to do in this, since we never subscribe to anything, we only publish. */
 static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_t event_id, void *event_data) {
   esp_mqtt_event_handle_t event = event_data;
   //esp_mqtt_client_handle_t client = event->client;
@@ -172,6 +175,8 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
   }
 }
 
+/** A BLE GATT callback where each event handler simply kicks things along to the next, until eventually
+ * it completes service discovery and then locates and reads the configured characteristic. */
 static void bt_gatt_event_handler(esp_gattc_cb_event_t event, esp_gatt_if_t gattc_if, esp_ble_gattc_cb_param_t *cb_param) {
   switch (event) {
     case ESP_GATTC_REG_EVT:
@@ -183,77 +188,68 @@ static void bt_gatt_event_handler(esp_gattc_cb_event_t event, esp_gatt_if_t gatt
       }
       ESP_LOGI(POOLOLOL_TAG, "REG_EVT");
 
-      ESP_ERROR_CHECK(esp_ble_gap_set_scan_params(&ble_scan_params));
+      ESP_ERROR_CHECK(esp_ble_gap_set_scan_params(&ble_scan_params)); // note that this kicks out to the GAP stack/callback, which handles scans
       break;
 
     case ESP_GATTC_CONNECT_EVT: {
       ESP_LOGI(POOLOLOL_TAG, "ESP_GATTC_CONNECT_EVT conn_id %d, if %d", cb_param->connect.conn_id, gattc_if);
       gattc_profile.conn_id = cb_param->connect.conn_id;
       memcpy(gattc_profile.remote_bda, cb_param->connect.remote_bda, sizeof(esp_bd_addr_t));
-      ESP_LOGI(POOLOLOL_TAG, "REMOTE BDA:");
+      ESP_LOGI(POOLOLOL_TAG, "Remote MAC address:");
       ESP_LOG_BUFFER_HEX(POOLOLOL_TAG, gattc_profile.remote_bda, sizeof(esp_bd_addr_t));
       esp_err_t err = esp_ble_gattc_send_mtu_req(gattc_if, gattc_profile.conn_id);
-      if (err) {
-        ESP_LOGE(POOLOLOL_TAG, "config MTU error: %s", esp_err_to_name(err));
-      }
+      if (err) ESP_LOGE(POOLOLOL_TAG, "error starting MTU configuration: %s", esp_err_to_name(err));
       break;
     }
 
     case ESP_GATTC_OPEN_EVT:
       if (cb_param->open.status != ESP_GATT_OK) {
-        ESP_LOGE(POOLOLOL_TAG, "open failed, status %d", cb_param->open.status);
+        ESP_LOGE(POOLOLOL_TAG, "failed to open the remote peer; status=%d", cb_param->open.status);
         break;
       }
-      ESP_LOGI(POOLOLOL_TAG, "open success");
+      ESP_LOGI(POOLOLOL_TAG, "opened remote peer");
       break;
 
     case ESP_GATTC_DIS_SRVC_CMPL_EVT:
       if (cb_param->dis_srvc_cmpl.status != ESP_GATT_OK) {
-        ESP_LOGE(POOLOLOL_TAG, "discover service failed, status %d", cb_param->dis_srvc_cmpl.status);
+        ESP_LOGE(POOLOLOL_TAG, "failed discovering services; status=%d", cb_param->dis_srvc_cmpl.status);
         break;
       }
-      ESP_LOGI(POOLOLOL_TAG, "discover service complete conn_id %d", cb_param->dis_srvc_cmpl.conn_id);
+      ESP_LOGI(POOLOLOL_TAG, "service discovery complete on conn_id=%d", cb_param->dis_srvc_cmpl.conn_id);
       esp_ble_gattc_search_service(gattc_if, cb_param->dis_srvc_cmpl.conn_id, &tps_temp_service_uuid);
       break;
 
     case ESP_GATTC_CFG_MTU_EVT:
       if (cb_param->cfg_mtu.status != ESP_GATT_OK) {
-        ESP_LOGE(POOLOLOL_TAG, "config mtu failed, error status = %x", cb_param->cfg_mtu.status);
+        ESP_LOGE(POOLOLOL_TAG, "failed to configure MTU; status=%x", cb_param->cfg_mtu.status);
       }
       ESP_LOGI(
-          POOLOLOL_TAG, "ESP_GATTC_CFG_MTU_EVT, Status %d, MTU %d, conn_id %d",
-          cb_param->cfg_mtu.status, cb_param->cfg_mtu.mtu, cb_param->cfg_mtu.conn_id);
+          POOLOLOL_TAG, "MTU configured on conn_id=%d with MTU=%d", cb_param->cfg_mtu.conn_id, cb_param->cfg_mtu.mtu);
       break;
 
     case ESP_GATTC_SEARCH_RES_EVT: {
-      ESP_LOGI(POOLOLOL_TAG, "SEARCH RES: conn_id = %x is primary service %d", cb_param->search_res.conn_id, cb_param->search_res.is_primary);
-      ESP_LOGI(POOLOLOL_TAG,
-               "start handle %d end handle %d current handle value %d",
-               cb_param->search_res.start_handle, cb_param->search_res.end_handle,
-               cb_param->search_res.srvc_id.inst_id);
+      ESP_LOGI(POOLOLOL_TAG, "processing scan hit on conn_id=%x; is_primary service=%d", cb_param->search_res.conn_id, cb_param->search_res.is_primary);
       if (cb_param->search_res.srvc_id.uuid.len == ESP_UUID_LEN_16 && cb_param->search_res.srvc_id.uuid.uuid.uuid16 == tps_temp_service_uuid.uuid.uuid16) {
-        ESP_LOGI(POOLOLOL_TAG, "service found");
         service_found = true;
         gattc_profile.service_start_handle = cb_param->search_res.start_handle;
         gattc_profile.service_end_handle = cb_param->search_res.end_handle;
-        ESP_LOGI(POOLOLOL_TAG, "UUID16: %x", cb_param->search_res.srvc_id.uuid.uuid.uuid16);
+        ESP_LOGI(POOLOLOL_TAG, "located target service; UUID=%x", tps_temp_service_uuid.uuid.uuid16);
       }
       break;
     }
 
     case ESP_GATTC_SEARCH_CMPL_EVT:
       if (cb_param->search_cmpl.status != ESP_GATT_OK) {
-        ESP_LOGE(POOLOLOL_TAG, "search service failed, error status = %x", cb_param->search_cmpl.status);
+        ESP_LOGE(POOLOLOL_TAG, "service search failed; status=%x", cb_param->search_cmpl.status);
         break;
       }
       if (cb_param->search_cmpl.searched_service_source == ESP_GATT_SERVICE_FROM_REMOTE_DEVICE) {
-        ESP_LOGI(POOLOLOL_TAG, "Get service information from remote device");
+        ESP_LOGI(POOLOLOL_TAG, "fetched service information from remote device");
       } else if (cb_param->search_cmpl.searched_service_source == ESP_GATT_SERVICE_FROM_NVS_FLASH) {
-        ESP_LOGI(POOLOLOL_TAG, "Get service information from flash");
+        ESP_LOGI(POOLOLOL_TAG, "loaded service information from flash");
       } else {
         ESP_LOGI(POOLOLOL_TAG, "unknown service source");
       }
-      ESP_LOGI(POOLOLOL_TAG, "ESP_GATTC_SEARCH_CMPL_EVT; service found %d", service_found);
       if (service_found) {
         uint16_t count = 0;
         esp_gatt_status_t status = esp_ble_gattc_get_attr_count(
@@ -262,14 +258,14 @@ static void bt_gatt_event_handler(esp_gattc_cb_event_t event, esp_gatt_if_t gatt
             gattc_profile.service_end_handle,
             0, &count);
         if (status != ESP_GATT_OK) {
-          ESP_LOGE(POOLOLOL_TAG, "esp_ble_gattc_get_attr_count error");
+          ESP_LOGE(POOLOLOL_TAG, "error retrieving service count; status=%d", status);
           break;
         }
 
         if (count > 0) {
           esp_gattc_char_elem_t *char_elem_result = (esp_gattc_char_elem_t *)malloc(sizeof(esp_gattc_char_elem_t) * count);
           if (!char_elem_result) {
-            ESP_LOGE(POOLOLOL_TAG, "gattc no mem");
+            ESP_LOGE(POOLOLOL_TAG, "error in malloc() -- no RAM to search for characteristic");
             break;
           } else {
             status = esp_ble_gattc_get_char_by_uuid(
@@ -278,27 +274,26 @@ static void bt_gatt_event_handler(esp_gattc_cb_event_t event, esp_gatt_if_t gatt
                 gattc_profile.service_end_handle,
                 tps_temp_characteristic_uuid, char_elem_result, &count);
             if (status != ESP_GATT_OK) {
-              ESP_LOGE(POOLOLOL_TAG, "esp_ble_gattc_get_char_by_uuid error");
+              ESP_LOGE(POOLOLOL_TAG, "error loading characteristic data; status=%d", status);
               free(char_elem_result);
               char_elem_result = NULL;
               break;
             }
 
             for (int i = 0; i < count; ++i) {
-              ESP_LOGI(POOLOLOL_TAG, "characteristic UUID: %x vs %x", char_elem_result[i].uuid.uuid.uuid16, tps_temp_characteristic_uuid.uuid.uuid16);
+              ESP_LOGD(POOLOLOL_TAG, "examining characteristic UUID: %x vs %x", char_elem_result[i].uuid.uuid.uuid16, tps_temp_characteristic_uuid.uuid.uuid16);
               if (char_elem_result[i].uuid.len == ESP_UUID_LEN_16 && char_elem_result[i].uuid.uuid.uuid16 == tps_temp_characteristic_uuid.uuid.uuid16) {
                 esp_err_t err = esp_ble_gattc_read_char(gattc_if, cb_param->search_cmpl.conn_id, char_elem_result[0].char_handle, ESP_GATT_AUTH_REQ_NONE);
-                if (err) {
-                  ESP_LOGI(POOLOLOL_TAG, "characteristic found but read failed: %s", esp_err_to_name(err));
-                }
-                break;
+                if (err) ESP_LOGI(POOLOLOL_TAG, "characteristic found, but read request failed: %s", esp_err_to_name(err));
+                
+                break; // for loop, not switch
               }
             }
           }
 
           free(char_elem_result);
         } else {
-          ESP_LOGE(POOLOLOL_TAG, "no char found");
+          ESP_LOGE(POOLOLOL_TAG, "target service had no characteristics?");
         }
       }
       break;
@@ -317,13 +312,13 @@ static void bt_gatt_event_handler(esp_gattc_cb_event_t event, esp_gatt_if_t gatt
     case ESP_GATTC_SRVC_CHG_EVT: {
       esp_bd_addr_t bda;
       memcpy(bda, cb_param->srvc_chg.remote_bda, sizeof(esp_bd_addr_t));
-      ESP_LOGI(POOLOLOL_TAG, "ESP_GATTC_SRVC_CHG_EVT, bd_addr:");
+      ESP_LOGI(POOLOLOL_TAG, "received a BT 'service changed' event? new(?) MAC is:");
       ESP_LOG_BUFFER_HEX(POOLOLOL_TAG, bda, sizeof(esp_bd_addr_t));
       break;
     }
 
     case ESP_GATTC_DISCONNECT_EVT:
-      ESP_LOGI(POOLOLOL_TAG, "ESP_GATTC_DISCONNECT_EVT, reason = %d", cb_param->disconnect.reason);
+      ESP_LOGI(POOLOLOL_TAG, "GATT disconnected; reason=%d", cb_param->disconnect.reason);
       if (connected) reset_bt();
       break;
 
@@ -332,12 +327,13 @@ static void bt_gatt_event_handler(esp_gattc_cb_event_t event, esp_gatt_if_t gatt
   }
 }
 
+/** Callback for BT GAP (scanning and advertising, basically) events. */
 static void bt_gap_event_handler(esp_gap_ble_cb_event_t event, esp_ble_gap_cb_param_t *cb_param) {
   uint8_t *adv_name = NULL;
   uint8_t adv_name_len = 0;
   switch (event) {
     case ESP_GAP_BLE_SCAN_PARAM_SET_COMPLETE_EVT:
-      poll_once(NULL); // this kicks off our first scan; subsequent scans will use timers
+      poll_once(NULL); // this kicks off our first scan immediately once parameters are set; subsequent scans will use timers
       break;
 
     case ESP_GAP_BLE_SCAN_RESULT_EVT: {
@@ -347,7 +343,7 @@ static void bt_gap_event_handler(esp_gap_ble_cb_event_t event, esp_ble_gap_cb_pa
           ESP_LOG_BUFFER_CHAR(POOLOLOL_TAG, adv_name, adv_name_len);
           if (adv_name != NULL) {
             if (strlen(remote_device_name) == adv_name_len && strncmp((char *)adv_name, remote_device_name, adv_name_len) == 0) {
-              ESP_LOGI(POOLOLOL_TAG, "matched device %s", remote_device_name);
+              ESP_LOGI(POOLOLOL_TAG, "matched target device by name: %s", remote_device_name);
               if (connected == false) {
                 connected = true;
                 ESP_LOGI(POOLOLOL_TAG, "connecting to %s", remote_device_name);
@@ -365,7 +361,7 @@ static void bt_gap_event_handler(esp_gap_ble_cb_event_t event, esp_ble_gap_cb_pa
     }
 
     case ESP_GAP_BLE_SCAN_TIMEOUT_EVT:
-      poll();
+      poll(); // if we don't see the target device during configured timeout, just start over and try again
       break;
 
     default:
@@ -383,12 +379,15 @@ void app_main() {
   }
   ESP_ERROR_CHECK(err);
 
+
+  // create timers for the BT poller, and for the heartbeat sender
   const esp_timer_create_args_t bt_poller_timer_args = { .callback = (void *)&poll_once };
   ESP_ERROR_CHECK(esp_timer_create(&bt_poller_timer_args, &poller_timer));
 
   const esp_timer_create_args_t heartbeat_poller_timer_args = { .callback = (void *)&heartbeat};
   ESP_ERROR_CHECK(esp_timer_create(&heartbeat_poller_timer_args, &heartbeat_timer));
   ESP_ERROR_CHECK(esp_timer_start_periodic(heartbeat_timer, 1000000ULL * CONFIG_POOLOLOL_MQTT_HEARTBEAT_PERIOD));
+
 
   // wiffies
   ESP_ERROR_CHECK(esp_netif_init());  // call only once, ever
@@ -409,13 +408,15 @@ void app_main() {
   ESP_ERROR_CHECK(esp_wifi_start());
   ESP_LOGE(POOLOLOL_TAG, "%s", "wifi started");
 
+
   // configure & start MQTT handler
   esp_mqtt_client_config_t mqtt_cfg = {.broker.address.uri = CONFIG_POOLOLOL_MQTT_URI};
   mqtt_client = esp_mqtt_client_init(&mqtt_cfg);
   esp_mqtt_client_register_event(mqtt_client, ESP_EVENT_ANY_ID, mqtt_event_handler, NULL);  // last argument can pass data to handler
   esp_mqtt_client_start(mqtt_client);
 
-  // the blue teeth
+
+  // the blue teeths
   esp_bt_controller_config_t bt_cfg = BT_CONTROLLER_INIT_CONFIG_DEFAULT();
   ESP_ERROR_CHECK(esp_bt_controller_init(&bt_cfg));
   ESP_ERROR_CHECK(esp_bt_controller_enable(ESP_BT_MODE_BLE));
@@ -423,6 +424,6 @@ void app_main() {
   ESP_ERROR_CHECK(esp_bluedroid_enable());
   ESP_ERROR_CHECK(esp_ble_gap_register_callback(bt_gap_event_handler));
   ESP_ERROR_CHECK(esp_ble_gattc_register_callback(bt_gatt_event_handler));
-  ESP_ERROR_CHECK(esp_ble_gattc_app_register(0));
+  ESP_ERROR_CHECK(esp_ble_gattc_app_register(0)); // hard-coded app ID, but for us this is fine
   ESP_ERROR_CHECK(esp_ble_gatt_set_local_mtu(500));
 }
