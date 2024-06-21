@@ -39,6 +39,8 @@ static struct gattc_profile_state {
   esp_bd_addr_t remote_bda;
 } gattc_profile = { .gattc_if = ESP_GATT_IF_NONE };
 
+
+/* Timers for the primary data poller, and for a health heartbeat */
 static esp_timer_handle_t poller_timer;
 static esp_timer_handle_t heartbeat_timer;
 
@@ -96,18 +98,11 @@ static void reset_bt() {
   //gattc_profile.gattc_if = ESP_GATT_IF_NONE; // don't need to clear this, it's just a hardware handle
 }
 
-/** Starts a poll that scans for an Inkbird widget. Embeds the timer delay, and ultimately calls poll_once(). */
-static esp_err_t poll() {
-  reset_bt();
-  ESP_LOGI(POOLOLOL_TAG, "requesting new pool attempt in %llu", POLL_PERIOD);
-  return esp_timer_start_once(poller_timer, POLL_PERIOD);
-}
-
 /** Kicks off the event chain that will scan for, connect to, query, and ultimately read the characteristic for a single sample collection. */
 static void poll_once() {
   ESP_LOGI(POOLOLOL_TAG, "new poll sequence started");
-  uint32_t duration = 60; // seconds
-  esp_ble_gap_start_scanning(duration);
+  reset_bt();
+  esp_ble_gap_start_scanning(CONFIG_POOLOLOL_POLL_PERIOD / 2); // scan for half the configured period, to allow for time to complete the connection
 }
 
 /** Sends a heartbeat message to the MQTT server on a separate topic from the data samples. Includes some system status info, because why not. */
@@ -303,10 +298,10 @@ static void bt_gatt_event_handler(esp_gattc_cb_event_t event, esp_gatt_if_t gatt
         if (cb_param->read.status == ESP_GATT_OK && cb_param->read.value_len >= 2) {
           uint8_t twobytes[2] = { cb_param->read.value[0], cb_param->read.value[1] };
           transmit_temperature(twobytes);
-          poll();
         } else {
           ESP_LOGE(POOLOLOL_TAG, "error reading characteristic, or not enough bytes; %x %d", cb_param->read.status, cb_param->read.value_len);
         }
+        reset_bt();
         break;
 
     case ESP_GATTC_SRVC_CHG_EVT: {
@@ -333,7 +328,9 @@ static void bt_gap_event_handler(esp_gap_ble_cb_event_t event, esp_ble_gap_cb_pa
   uint8_t adv_name_len = 0;
   switch (event) {
     case ESP_GAP_BLE_SCAN_PARAM_SET_COMPLETE_EVT:
-      poll_once(NULL); // this kicks off our first scan immediately once parameters are set; subsequent scans will use timers
+      // kick off the first scan immediately & start timer for subsequent scans
+      poll_once();
+      ESP_ERROR_CHECK(esp_timer_start_periodic(poller_timer, POLL_PERIOD));
       break;
 
     case ESP_GAP_BLE_SCAN_RESULT_EVT: {
@@ -361,7 +358,6 @@ static void bt_gap_event_handler(esp_gap_ble_cb_event_t event, esp_ble_gap_cb_pa
     }
 
     case ESP_GAP_BLE_SCAN_TIMEOUT_EVT:
-      poll(); // if we don't see the target device during configured timeout, just start over and try again
       break;
 
     default:
